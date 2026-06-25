@@ -1,0 +1,939 @@
+<?R
+	source("conf.R") 
+	c_header();
+	
+	source("lib/feq.R")
+	source("lib/boundary.R")
+
+	U = as.matrix(Density[Density$group=='f',c("dx","dy")])
+
+	EQ = MRT_eq(U, ortogonal=FALSE)
+        wi = subst(EQ$Req, Jx=0, Jy=0, Jz=0)
+        wi = subst(wi, rho=1)
+        wi = gapply(wi,function(x) x$.M, simplify=TRUE)
+        wi = wi %*% solve(EQ$mat)
+	wi = as.vector(wi)
+
+	W = solve(EQ$mat) %*% diag(1/wi) %*% solve(t(EQ$mat))
+	i = rev(1:nrow(W))
+	H = chol(W[i,i])[i,i]
+	H = H * c(1,sqrt(3)/3,sqrt(3)/3,sqrt(2),sqrt(2),1,sqrt(6)/3,sqrt(6)/3,2)
+	B = EQ$mat %*% t(H)
+
+	EQ = MRT_eq(U, mat=B)
+
+	
+
+	f = PV(Density[Density$group=='f',"name"])
+	f_neighbours = Density$nicename[Density$group=='f']
+    IG_f = PV(paste0("IG_f_", 1:8))
+	rho = PV("rho")
+	J = PV("J",c("x","y"))
+    IG_has = PV("IG_has")
+    IG_xi_x = PV("IG_xi_x")
+    IG_xi_y = PV("IG_xi_y")
+    IG_inside_mask = PV("IG_inside_mask")
+    if ( Options$bc ) {
+        BC_Velocity=PV(c('BC[0]', 'BC[1]'))
+    } else {
+        BC_Velocity=PV(c('VelocityX', 'VelocityY'))
+    }
+?>
+
+#define pi 3.141592653589793116
+
+CudaDeviceFunction int IGIsFinite(const real_t v)
+{
+    // Device-friendly finite check without relying on std::isfinite.
+    return (v == v) && (v > -1e30) && (v < 1e30);
+}
+
+CudaDeviceFunction real_t getRho(){
+	return <?R C(sum(f)) ?> ;
+}
+    
+CudaDeviceFunction vector_t getU(){
+	real_t d = <?R C(sum(f)) ?>;
+	vector_t u;
+<?R C(PV(c("u.x","u.y")), f %*% U) ?>
+    u.x /= d;
+	u.y /= d;
+<?R if ( Options$bc ) { ?>
+    if (!IamBOUNDARY) {   
+        u.x += BC[0]*0.5;
+        u.y += BC[1]*0.5;
+    }
+<?R } ?>
+    u.x += GravitationX*0.5;
+    u.y += GravitationY*0.5;
+	u.z = 0.0;
+	return u;
+}
+
+CudaDeviceFunction float2 Color() {
+        float2 ret;
+        vector_t u = getU();
+        ret.x = sqrt(u.x*u.x + u.y*u.y);
+        if (NodeType == NODE_Solid){
+                ret.y = 0;
+        } else {
+                ret.y = 1;
+        }
+        return ret;
+}
+
+CudaDeviceFunction void SetEquilibrum(real_t rho, real_t Jx, real_t Jy)
+{
+<?R
+	feq = EQ$Req %*% solve(EQ$mat)
+	C( f, feq)
+?>
+
+<?R if ( Options$bc ) { ?>
+   if ( IamBOUNDARY ) {
+       BC[0] = Jx / rho;
+       BC[1] = Jy / rho;
+   } else {
+       BC[0] = 0;
+       BC[1] = 0;
+   }
+<?R } ?>
+}
+
+CudaDeviceFunction real_t IGGetNodePopulation(const int q, const int dx, const int dy)
+{
+    if (q == 0) return f[q];
+    switch (q) {
+    case 1:
+        switch (dx) {
+        case -2: switch (dy) { case -2: return IG_f_1(-2, -2, 0); case -1: return IG_f_1(-2, -1, 0); case 0: return IG_f_1(-2, 0, 0); case 1: return IG_f_1(-2, 1, 0); case 2: return IG_f_1(-2, 2, 0); default: return IG_f_1(0, 0, 0); }
+        case -1: switch (dy) { case -2: return IG_f_1(-1, -2, 0); case -1: return IG_f_1(-1, -1, 0); case 0: return IG_f_1(-1, 0, 0); case 1: return IG_f_1(-1, 1, 0); case 2: return IG_f_1(-1, 2, 0); default: return IG_f_1(0, 0, 0); }
+        case 0:  switch (dy) { case -2: return IG_f_1(0, -2, 0); case -1: return IG_f_1(0, -1, 0); case 0: return IG_f_1(0, 0, 0); case 1: return IG_f_1(0, 1, 0); case 2: return IG_f_1(0, 2, 0); default: return IG_f_1(0, 0, 0); }
+        case 1:  switch (dy) { case -2: return IG_f_1(1, -2, 0); case -1: return IG_f_1(1, -1, 0); case 0: return IG_f_1(1, 0, 0); case 1: return IG_f_1(1, 1, 0); case 2: return IG_f_1(1, 2, 0); default: return IG_f_1(0, 0, 0); }
+        case 2:  switch (dy) { case -2: return IG_f_1(2, -2, 0); case -1: return IG_f_1(2, -1, 0); case 0: return IG_f_1(2, 0, 0); case 1: return IG_f_1(2, 1, 0); case 2: return IG_f_1(2, 2, 0); default: return IG_f_1(0, 0, 0); }
+        default: return IG_f_1(0, 0, 0);
+        }
+    case 2:
+        switch (dx) {
+        case -2: switch (dy) { case -2: return IG_f_2(-2, -2, 0); case -1: return IG_f_2(-2, -1, 0); case 0: return IG_f_2(-2, 0, 0); case 1: return IG_f_2(-2, 1, 0); case 2: return IG_f_2(-2, 2, 0); default: return IG_f_2(0, 0, 0); }
+        case -1: switch (dy) { case -2: return IG_f_2(-1, -2, 0); case -1: return IG_f_2(-1, -1, 0); case 0: return IG_f_2(-1, 0, 0); case 1: return IG_f_2(-1, 1, 0); case 2: return IG_f_2(-1, 2, 0); default: return IG_f_2(0, 0, 0); }
+        case 0:  switch (dy) { case -2: return IG_f_2(0, -2, 0); case -1: return IG_f_2(0, -1, 0); case 0: return IG_f_2(0, 0, 0); case 1: return IG_f_2(0, 1, 0); case 2: return IG_f_2(0, 2, 0); default: return IG_f_2(0, 0, 0); }
+        case 1:  switch (dy) { case -2: return IG_f_2(1, -2, 0); case -1: return IG_f_2(1, -1, 0); case 0: return IG_f_2(1, 0, 0); case 1: return IG_f_2(1, 1, 0); case 2: return IG_f_2(1, 2, 0); default: return IG_f_2(0, 0, 0); }
+        case 2:  switch (dy) { case -2: return IG_f_2(2, -2, 0); case -1: return IG_f_2(2, -1, 0); case 0: return IG_f_2(2, 0, 0); case 1: return IG_f_2(2, 1, 0); case 2: return IG_f_2(2, 2, 0); default: return IG_f_2(0, 0, 0); }
+        default: return IG_f_2(0, 0, 0);
+        }
+    case 3:
+        switch (dx) {
+        case -2: switch (dy) { case -2: return IG_f_3(-2, -2, 0); case -1: return IG_f_3(-2, -1, 0); case 0: return IG_f_3(-2, 0, 0); case 1: return IG_f_3(-2, 1, 0); case 2: return IG_f_3(-2, 2, 0); default: return IG_f_3(0, 0, 0); }
+        case -1: switch (dy) { case -2: return IG_f_3(-1, -2, 0); case -1: return IG_f_3(-1, -1, 0); case 0: return IG_f_3(-1, 0, 0); case 1: return IG_f_3(-1, 1, 0); case 2: return IG_f_3(-1, 2, 0); default: return IG_f_3(0, 0, 0); }
+        case 0:  switch (dy) { case -2: return IG_f_3(0, -2, 0); case -1: return IG_f_3(0, -1, 0); case 0: return IG_f_3(0, 0, 0); case 1: return IG_f_3(0, 1, 0); case 2: return IG_f_3(0, 2, 0); default: return IG_f_3(0, 0, 0); }
+        case 1:  switch (dy) { case -2: return IG_f_3(1, -2, 0); case -1: return IG_f_3(1, -1, 0); case 0: return IG_f_3(1, 0, 0); case 1: return IG_f_3(1, 1, 0); case 2: return IG_f_3(1, 2, 0); default: return IG_f_3(0, 0, 0); }
+        case 2:  switch (dy) { case -2: return IG_f_3(2, -2, 0); case -1: return IG_f_3(2, -1, 0); case 0: return IG_f_3(2, 0, 0); case 1: return IG_f_3(2, 1, 0); case 2: return IG_f_3(2, 2, 0); default: return IG_f_3(0, 0, 0); }
+        default: return IG_f_3(0, 0, 0);
+        }
+    case 4:
+        switch (dx) {
+        case -2: switch (dy) { case -2: return IG_f_4(-2, -2, 0); case -1: return IG_f_4(-2, -1, 0); case 0: return IG_f_4(-2, 0, 0); case 1: return IG_f_4(-2, 1, 0); case 2: return IG_f_4(-2, 2, 0); default: return IG_f_4(0, 0, 0); }
+        case -1: switch (dy) { case -2: return IG_f_4(-1, -2, 0); case -1: return IG_f_4(-1, -1, 0); case 0: return IG_f_4(-1, 0, 0); case 1: return IG_f_4(-1, 1, 0); case 2: return IG_f_4(-1, 2, 0); default: return IG_f_4(0, 0, 0); }
+        case 0:  switch (dy) { case -2: return IG_f_4(0, -2, 0); case -1: return IG_f_4(0, -1, 0); case 0: return IG_f_4(0, 0, 0); case 1: return IG_f_4(0, 1, 0); case 2: return IG_f_4(0, 2, 0); default: return IG_f_4(0, 0, 0); }
+        case 1:  switch (dy) { case -2: return IG_f_4(1, -2, 0); case -1: return IG_f_4(1, -1, 0); case 0: return IG_f_4(1, 0, 0); case 1: return IG_f_4(1, 1, 0); case 2: return IG_f_4(1, 2, 0); default: return IG_f_4(0, 0, 0); }
+        case 2:  switch (dy) { case -2: return IG_f_4(2, -2, 0); case -1: return IG_f_4(2, -1, 0); case 0: return IG_f_4(2, 0, 0); case 1: return IG_f_4(2, 1, 0); case 2: return IG_f_4(2, 2, 0); default: return IG_f_4(0, 0, 0); }
+        default: return IG_f_4(0, 0, 0);
+        }
+    case 5:
+        switch (dx) {
+        case -2: switch (dy) { case -2: return IG_f_5(-2, -2, 0); case -1: return IG_f_5(-2, -1, 0); case 0: return IG_f_5(-2, 0, 0); case 1: return IG_f_5(-2, 1, 0); case 2: return IG_f_5(-2, 2, 0); default: return IG_f_5(0, 0, 0); }
+        case -1: switch (dy) { case -2: return IG_f_5(-1, -2, 0); case -1: return IG_f_5(-1, -1, 0); case 0: return IG_f_5(-1, 0, 0); case 1: return IG_f_5(-1, 1, 0); case 2: return IG_f_5(-1, 2, 0); default: return IG_f_5(0, 0, 0); }
+        case 0:  switch (dy) { case -2: return IG_f_5(0, -2, 0); case -1: return IG_f_5(0, -1, 0); case 0: return IG_f_5(0, 0, 0); case 1: return IG_f_5(0, 1, 0); case 2: return IG_f_5(0, 2, 0); default: return IG_f_5(0, 0, 0); }
+        case 1:  switch (dy) { case -2: return IG_f_5(1, -2, 0); case -1: return IG_f_5(1, -1, 0); case 0: return IG_f_5(1, 0, 0); case 1: return IG_f_5(1, 1, 0); case 2: return IG_f_5(1, 2, 0); default: return IG_f_5(0, 0, 0); }
+        case 2:  switch (dy) { case -2: return IG_f_5(2, -2, 0); case -1: return IG_f_5(2, -1, 0); case 0: return IG_f_5(2, 0, 0); case 1: return IG_f_5(2, 1, 0); case 2: return IG_f_5(2, 2, 0); default: return IG_f_5(0, 0, 0); }
+        default: return IG_f_5(0, 0, 0);
+        }
+    case 6:
+        switch (dx) {
+        case -2: switch (dy) { case -2: return IG_f_6(-2, -2, 0); case -1: return IG_f_6(-2, -1, 0); case 0: return IG_f_6(-2, 0, 0); case 1: return IG_f_6(-2, 1, 0); case 2: return IG_f_6(-2, 2, 0); default: return IG_f_6(0, 0, 0); }
+        case -1: switch (dy) { case -2: return IG_f_6(-1, -2, 0); case -1: return IG_f_6(-1, -1, 0); case 0: return IG_f_6(-1, 0, 0); case 1: return IG_f_6(-1, 1, 0); case 2: return IG_f_6(-1, 2, 0); default: return IG_f_6(0, 0, 0); }
+        case 0:  switch (dy) { case -2: return IG_f_6(0, -2, 0); case -1: return IG_f_6(0, -1, 0); case 0: return IG_f_6(0, 0, 0); case 1: return IG_f_6(0, 1, 0); case 2: return IG_f_6(0, 2, 0); default: return IG_f_6(0, 0, 0); }
+        case 1:  switch (dy) { case -2: return IG_f_6(1, -2, 0); case -1: return IG_f_6(1, -1, 0); case 0: return IG_f_6(1, 0, 0); case 1: return IG_f_6(1, 1, 0); case 2: return IG_f_6(1, 2, 0); default: return IG_f_6(0, 0, 0); }
+        case 2:  switch (dy) { case -2: return IG_f_6(2, -2, 0); case -1: return IG_f_6(2, -1, 0); case 0: return IG_f_6(2, 0, 0); case 1: return IG_f_6(2, 1, 0); case 2: return IG_f_6(2, 2, 0); default: return IG_f_6(0, 0, 0); }
+        default: return IG_f_6(0, 0, 0);
+        }
+    case 7:
+        switch (dx) {
+        case -2: switch (dy) { case -2: return IG_f_7(-2, -2, 0); case -1: return IG_f_7(-2, -1, 0); case 0: return IG_f_7(-2, 0, 0); case 1: return IG_f_7(-2, 1, 0); case 2: return IG_f_7(-2, 2, 0); default: return IG_f_7(0, 0, 0); }
+        case -1: switch (dy) { case -2: return IG_f_7(-1, -2, 0); case -1: return IG_f_7(-1, -1, 0); case 0: return IG_f_7(-1, 0, 0); case 1: return IG_f_7(-1, 1, 0); case 2: return IG_f_7(-1, 2, 0); default: return IG_f_7(0, 0, 0); }
+        case 0:  switch (dy) { case -2: return IG_f_7(0, -2, 0); case -1: return IG_f_7(0, -1, 0); case 0: return IG_f_7(0, 0, 0); case 1: return IG_f_7(0, 1, 0); case 2: return IG_f_7(0, 2, 0); default: return IG_f_7(0, 0, 0); }
+        case 1:  switch (dy) { case -2: return IG_f_7(1, -2, 0); case -1: return IG_f_7(1, -1, 0); case 0: return IG_f_7(1, 0, 0); case 1: return IG_f_7(1, 1, 0); case 2: return IG_f_7(1, 2, 0); default: return IG_f_7(0, 0, 0); }
+        case 2:  switch (dy) { case -2: return IG_f_7(2, -2, 0); case -1: return IG_f_7(2, -1, 0); case 0: return IG_f_7(2, 0, 0); case 1: return IG_f_7(2, 1, 0); case 2: return IG_f_7(2, 2, 0); default: return IG_f_7(0, 0, 0); }
+        default: return IG_f_7(0, 0, 0);
+        }
+    case 8:
+        switch (dx) {
+        case -2: switch (dy) { case -2: return IG_f_8(-2, -2, 0); case -1: return IG_f_8(-2, -1, 0); case 0: return IG_f_8(-2, 0, 0); case 1: return IG_f_8(-2, 1, 0); case 2: return IG_f_8(-2, 2, 0); default: return IG_f_8(0, 0, 0); }
+        case -1: switch (dy) { case -2: return IG_f_8(-1, -2, 0); case -1: return IG_f_8(-1, -1, 0); case 0: return IG_f_8(-1, 0, 0); case 1: return IG_f_8(-1, 1, 0); case 2: return IG_f_8(-1, 2, 0); default: return IG_f_8(0, 0, 0); }
+        case 0:  switch (dy) { case -2: return IG_f_8(0, -2, 0); case -1: return IG_f_8(0, -1, 0); case 0: return IG_f_8(0, 0, 0); case 1: return IG_f_8(0, 1, 0); case 2: return IG_f_8(0, 2, 0); default: return IG_f_8(0, 0, 0); }
+        case 1:  switch (dy) { case -2: return IG_f_8(1, -2, 0); case -1: return IG_f_8(1, -1, 0); case 0: return IG_f_8(1, 0, 0); case 1: return IG_f_8(1, 1, 0); case 2: return IG_f_8(1, 2, 0); default: return IG_f_8(0, 0, 0); }
+        case 2:  switch (dy) { case -2: return IG_f_8(2, -2, 0); case -1: return IG_f_8(2, -1, 0); case 0: return IG_f_8(2, 0, 0); case 1: return IG_f_8(2, 1, 0); case 2: return IG_f_8(2, 2, 0); default: return IG_f_8(0, 0, 0); }
+        default: return IG_f_8(0, 0, 0);
+        }
+    default: return f[q];
+    }
+}
+
+CudaDeviceFunction void IGGetNodeState(const int dx, const int dy, real_t* rho_o, real_t* ux_o, real_t* uy_o)
+{
+    switch (dx) {
+    case -2:
+        switch (dy) {
+        case -2:
+            *rho_o = IG_rho_cache(-2, -2);
+            *ux_o = IG_ux_cache(-2, -2);
+            *uy_o = IG_uy_cache(-2, -2);
+            return;
+        case -1:
+            *rho_o = IG_rho_cache(-2, -1);
+            *ux_o = IG_ux_cache(-2, -1);
+            *uy_o = IG_uy_cache(-2, -1);
+            return;
+        case 0:
+            *rho_o = IG_rho_cache(-2, 0);
+            *ux_o = IG_ux_cache(-2, 0);
+            *uy_o = IG_uy_cache(-2, 0);
+            return;
+        case 1:
+            *rho_o = IG_rho_cache(-2, 1);
+            *ux_o = IG_ux_cache(-2, 1);
+            *uy_o = IG_uy_cache(-2, 1);
+            return;
+        case 2:
+            *rho_o = IG_rho_cache(-2, 2);
+            *ux_o = IG_ux_cache(-2, 2);
+            *uy_o = IG_uy_cache(-2, 2);
+            return;
+        default:
+            break;
+        }
+        break;
+    case -1:
+        switch (dy) {
+        case -2:
+            *rho_o = IG_rho_cache(-1, -2);
+            *ux_o = IG_ux_cache(-1, -2);
+            *uy_o = IG_uy_cache(-1, -2);
+            return;
+        case -1:
+            *rho_o = IG_rho_cache(-1, -1);
+            *ux_o = IG_ux_cache(-1, -1);
+            *uy_o = IG_uy_cache(-1, -1);
+            return;
+        case 0:
+            *rho_o = IG_rho_cache(-1, 0);
+            *ux_o = IG_ux_cache(-1, 0);
+            *uy_o = IG_uy_cache(-1, 0);
+            return;
+        case 1:
+            *rho_o = IG_rho_cache(-1, 1);
+            *ux_o = IG_ux_cache(-1, 1);
+            *uy_o = IG_uy_cache(-1, 1);
+            return;
+        case 2:
+            *rho_o = IG_rho_cache(-1, 2);
+            *ux_o = IG_ux_cache(-1, 2);
+            *uy_o = IG_uy_cache(-1, 2);
+            return;
+        default:
+            break;
+        }
+        break;
+    case 0:
+        switch (dy) {
+        case -2:
+            *rho_o = IG_rho_cache(0, -2);
+            *ux_o = IG_ux_cache(0, -2);
+            *uy_o = IG_uy_cache(0, -2);
+            return;
+        case -1:
+            *rho_o = IG_rho_cache(0, -1);
+            *ux_o = IG_ux_cache(0, -1);
+            *uy_o = IG_uy_cache(0, -1);
+            return;
+        case 0:
+            *rho_o = IG_rho_cache;
+            *ux_o = IG_ux_cache;
+            *uy_o = IG_uy_cache;
+            return;
+        case 1:
+            *rho_o = IG_rho_cache(0, 1);
+            *ux_o = IG_ux_cache(0, 1);
+            *uy_o = IG_uy_cache(0, 1);
+            return;
+        case 2:
+            *rho_o = IG_rho_cache(0, 2);
+            *ux_o = IG_ux_cache(0, 2);
+            *uy_o = IG_uy_cache(0, 2);
+            return;
+        default:
+            break;
+        }
+        break;
+    case 1:
+        switch (dy) {
+        case -2:
+            *rho_o = IG_rho_cache(1, -2);
+            *ux_o = IG_ux_cache(1, -2);
+            *uy_o = IG_uy_cache(1, -2);
+            return;
+        case -1:
+            *rho_o = IG_rho_cache(1, -1);
+            *ux_o = IG_ux_cache(1, -1);
+            *uy_o = IG_uy_cache(1, -1);
+            return;
+        case 0:
+            *rho_o = IG_rho_cache(1, 0);
+            *ux_o = IG_ux_cache(1, 0);
+            *uy_o = IG_uy_cache(1, 0);
+            return;
+        case 1:
+            *rho_o = IG_rho_cache(1, 1);
+            *ux_o = IG_ux_cache(1, 1);
+            *uy_o = IG_uy_cache(1, 1);
+            return;
+        case 2:
+            *rho_o = IG_rho_cache(1, 2);
+            *ux_o = IG_ux_cache(1, 2);
+            *uy_o = IG_uy_cache(1, 2);
+            return;
+        default:
+            break;
+        }
+        break;
+    case 2:
+        switch (dy) {
+        case -2:
+            *rho_o = IG_rho_cache(2, -2);
+            *ux_o = IG_ux_cache(2, -2);
+            *uy_o = IG_uy_cache(2, -2);
+            return;
+        case -1:
+            *rho_o = IG_rho_cache(2, -1);
+            *ux_o = IG_ux_cache(2, -1);
+            *uy_o = IG_uy_cache(2, -1);
+            return;
+        case 0:
+            *rho_o = IG_rho_cache(2, 0);
+            *ux_o = IG_ux_cache(2, 0);
+            *uy_o = IG_uy_cache(2, 0);
+            return;
+        case 1:
+            *rho_o = IG_rho_cache(2, 1);
+            *ux_o = IG_ux_cache(2, 1);
+            *uy_o = IG_uy_cache(2, 1);
+            return;
+        case 2:
+            *rho_o = IG_rho_cache(2, 2);
+            *ux_o = IG_ux_cache(2, 2);
+            *uy_o = IG_uy_cache(2, 2);
+            return;
+        default:
+            break;
+        }
+        break;
+    }
+
+    *rho_o = IG_rho_cache;
+    *ux_o = IG_ux_cache;
+    *uy_o = IG_uy_cache;
+}
+
+CudaDeviceFunction real_t IGGetNodeInsideMask(const int dx, const int dy)
+{
+    switch (dx) {
+    case -2:
+        switch (dy) {
+        case -2: return IG_inside_mask(-2, -2);
+        case -1: return IG_inside_mask(-2, -1);
+        case 0:  return IG_inside_mask(-2, 0);
+        case 1:  return IG_inside_mask(-2, 1);
+        case 2:  return IG_inside_mask(-2, 2);
+        default: return 0.0;
+        }
+    case -1:
+        switch (dy) {
+        case -2: return IG_inside_mask(-1, -2);
+        case -1: return IG_inside_mask(-1, -1);
+        case 0:  return IG_inside_mask(-1, 0);
+        case 1:  return IG_inside_mask(-1, 1);
+        case 2:  return IG_inside_mask(-1, 2);
+        default: return 0.0;
+        }
+    case 0:
+        switch (dy) {
+        case -2: return IG_inside_mask(0, -2);
+        case -1: return IG_inside_mask(0, -1);
+        case 0:  return IG_inside_mask;
+        case 1:  return IG_inside_mask(0, 1);
+        case 2:  return IG_inside_mask(0, 2);
+        default: return 0.0;
+        }
+    case 1:
+        switch (dy) {
+        case -2: return IG_inside_mask(1, -2);
+        case -1: return IG_inside_mask(1, -1);
+        case 0:  return IG_inside_mask(1, 0);
+        case 1:  return IG_inside_mask(1, 1);
+        case 2:  return IG_inside_mask(1, 2);
+        default: return 0.0;
+        }
+    case 2:
+        switch (dy) {
+        case -2: return IG_inside_mask(2, -2);
+        case -1: return IG_inside_mask(2, -1);
+        case 0:  return IG_inside_mask(2, 0);
+        case 1:  return IG_inside_mask(2, 1);
+        case 2:  return IG_inside_mask(2, 2);
+        default: return 0.0;
+        }
+    default:
+        return 0.0;
+    }
+}
+
+CudaDeviceFunction int IGBaseCellIndex(const real_t rel)
+{
+    // Integer truncation rounds toward zero, so correct negatives to get floor(rel).
+    int i = (int)rel;
+    if ((real_t)i > rel) {
+        i -= 1;
+    }
+    if (i < -2) i = -2;
+    if (i > 1) i = 1;
+    return i;
+}
+
+CudaDeviceFunction void IGUpdateMacroCache()
+{
+    real_t rho_l = getRho();
+    vector_t u_l = getU();
+    if (rho_l <= 1e-20 || !IGIsFinite(rho_l) || !IGIsFinite(u_l.x) || !IGIsFinite(u_l.y)) {
+        rho_l = 1.0;
+        u_l.x = 0.0;
+        u_l.y = 0.0;
+    }
+    IG_rho_cache = rho_l;
+    IG_ux_cache = u_l.x;
+    IG_uy_cache = u_l.y;
+    IG_f_1 = f[1];
+    IG_f_2 = f[2];
+    IG_f_3 = f[3];
+    IG_f_4 = f[4];
+    IG_f_5 = f[5];
+    IG_f_6 = f[6];
+    IG_f_7 = f[7];
+    IG_f_8 = f[8];
+}
+
+CudaDeviceFunction void IGBilinearImageState(
+    const real_t xi_x,
+    const real_t xi_y,
+    real_t* rho_i,
+    real_t* ui_x,
+    real_t* ui_y)
+{
+    real_t x_rel = xi_x - (real_t)X;
+    real_t y_rel = xi_y - (real_t)Y;
+
+    int ix0 = IGBaseCellIndex(x_rel);
+    int iy0 = IGBaseCellIndex(y_rel);
+
+    real_t tx = x_rel - (real_t)ix0;
+    real_t ty = y_rel - (real_t)iy0;
+    if (tx < 0.0) tx = 0.0;
+    if (tx > 1.0) tx = 1.0;
+    if (ty < 0.0) ty = 0.0;
+    if (ty > 1.0) ty = 1.0;
+
+    real_t r00, r10, r01, r11;
+    real_t ux00, ux10, ux01, ux11;
+    real_t uy00, uy10, uy01, uy11;
+
+    IGGetNodeState(ix0,     iy0,     &r00, &ux00, &uy00);
+    IGGetNodeState(ix0 + 1, iy0,     &r10, &ux10, &uy10);
+    IGGetNodeState(ix0,     iy0 + 1, &r01, &ux01, &uy01);
+    IGGetNodeState(ix0 + 1, iy0 + 1, &r11, &ux11, &uy11);
+
+    real_t w00 = (1.0 - tx) * (1.0 - ty);
+    real_t w10 = tx * (1.0 - ty);
+    real_t w01 = (1.0 - tx) * ty;
+    real_t w11 = tx * ty;
+
+    real_t m00 = (IGGetNodeInsideMask(ix0,     iy0)     > 0.5) ? 1.0 : 0.0;
+    real_t m10 = (IGGetNodeInsideMask(ix0 + 1, iy0)     > 0.5) ? 1.0 : 0.0;
+    real_t m01 = (IGGetNodeInsideMask(ix0,     iy0 + 1) > 0.5) ? 1.0 : 0.0;
+    real_t m11 = (IGGetNodeInsideMask(ix0 + 1, iy0 + 1) > 0.5) ? 1.0 : 0.0;
+
+    // Do not blend across a wall corner: require a fully interior 2x2 stencil.
+    if (m00 < 0.5 || m10 < 0.5 || m01 < 0.5 || m11 < 0.5) {
+        *rho_i = IG_rho_cache;
+        *ui_x = IG_ux_cache;
+        *ui_y = IG_uy_cache;
+        return;
+    }
+
+    real_t wm00 = w00 * m00;
+    real_t wm10 = w10 * m10;
+    real_t wm01 = w01 * m01;
+    real_t wm11 = w11 * m11;
+    real_t wsum = wm00 + wm10 + wm01 + wm11;
+
+    if (wsum <= 1e-20) {
+        *rho_i = IG_rho_cache;
+        *ui_x = IG_ux_cache;
+        *ui_y = IG_uy_cache;
+        return;
+    }
+
+    *rho_i = (wm00 * r00 + wm10 * r10 + wm01 * r01 + wm11 * r11) / wsum;
+    *ui_x = (wm00 * ux00 + wm10 * ux10 + wm01 * ux01 + wm11 * ux11) / wsum;
+    *ui_y = (wm00 * uy00 + wm10 * uy10 + wm01 * uy01 + wm11 * uy11) / wsum;
+}
+
+CudaDeviceFunction real_t IGBilinearImagePopulation(const int q, const real_t xi_x, const real_t xi_y)
+{
+    real_t x_rel = xi_x - (real_t)X;
+    real_t y_rel = xi_y - (real_t)Y;
+
+    int ix0 = IGBaseCellIndex(x_rel);
+    int iy0 = IGBaseCellIndex(y_rel);
+
+    real_t tx = x_rel - (real_t)ix0;
+    real_t ty = y_rel - (real_t)iy0;
+    if (tx < 0.0) tx = 0.0;
+    if (tx > 1.0) tx = 1.0;
+    if (ty < 0.0) ty = 0.0;
+    if (ty > 1.0) ty = 1.0;
+
+    real_t f00 = IGGetNodePopulation(q, ix0,     iy0);
+    real_t f10 = IGGetNodePopulation(q, ix0 + 1, iy0);
+    real_t f01 = IGGetNodePopulation(q, ix0,     iy0 + 1);
+    real_t f11 = IGGetNodePopulation(q, ix0 + 1, iy0 + 1);
+
+    real_t w00 = (1.0 - tx) * (1.0 - ty);
+    real_t w10 = tx * (1.0 - ty);
+    real_t w01 = (1.0 - tx) * ty;
+    real_t w11 = tx * ty;
+
+    real_t m00 = (IGGetNodeInsideMask(ix0,     iy0)     > 0.5) ? 1.0 : 0.0;
+    real_t m10 = (IGGetNodeInsideMask(ix0 + 1, iy0)     > 0.5) ? 1.0 : 0.0;
+    real_t m01 = (IGGetNodeInsideMask(ix0,     iy0 + 1) > 0.5) ? 1.0 : 0.0;
+    real_t m11 = (IGGetNodeInsideMask(ix0 + 1, iy0 + 1) > 0.5) ? 1.0 : 0.0;
+
+    // Do not blend across a wall corner: require a fully interior 2x2 stencil.
+    if (m00 < 0.5 || m10 < 0.5 || m01 < 0.5 || m11 < 0.5) {
+        // Use the image-point state to build a consistent equilibrium fallback.
+        real_t rho_i, ui_x, ui_y;
+        IGBilinearImageState(xi_x, xi_y, &rho_i, &ui_x, &ui_y);
+        if (rho_i <= 1e-20 || !IGIsFinite(rho_i) || !IGIsFinite(ui_x) || !IGIsFinite(ui_y)) {
+            rho_i = 1.0 + Pressure * 3.0;
+            ui_x = VelocityX;
+            ui_y = VelocityY;
+        }
+        const real_t cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
+        const real_t cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
+        const real_t w[9]  = {4.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0};
+        real_t cu_i = cx[q] * ui_x + cy[q] * ui_y;
+        real_t ui2 = ui_x * ui_x + ui_y * ui_y;
+        return w[q] * rho_i * (1.0 + 3.0 * cu_i + 4.5 * cu_i * cu_i - 1.5 * ui2);
+    }
+
+    real_t wm00 = w00 * m00;
+    real_t wm10 = w10 * m10;
+    real_t wm01 = w01 * m01;
+    real_t wm11 = w11 * m11;
+    real_t wsum = wm00 + wm10 + wm01 + wm11;
+
+    if (wsum <= 1e-20) {
+        // Do not fall back to local ghost population here; use image-point eq
+        real_t rho_i, ui_x, ui_y;
+        IGBilinearImageState(xi_x, xi_y, &rho_i, &ui_x, &ui_y);
+        if (rho_i <= 1e-20 || !IGIsFinite(rho_i) || !IGIsFinite(ui_x) || !IGIsFinite(ui_y)) {
+            rho_i = 1.0 + Pressure * 3.0;
+            ui_x = VelocityX;
+            ui_y = VelocityY;
+        }
+        const real_t cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
+        const real_t cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
+        const real_t w[9]  = {4.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0};
+        real_t cu_i = cx[q] * ui_x + cy[q] * ui_y;
+        real_t ui2 = ui_x * ui_x + ui_y * ui_y;
+        return w[q] * rho_i * (1.0 + 3.0 * cu_i + 4.5 * cu_i * cu_i - 1.5 * ui2);
+    }
+
+    return (wm00 * f00 + wm10 * f10 + wm01 * f01 + wm11 * f11) / wsum;
+}
+
+CudaDeviceFunction void Init() {
+	real_t rho, ux, uy;
+   	rho = (1+Pressure*3);
+	ux = VelocityX;
+    uy = VelocityY;
+    if (IamWall){
+        rho = 1;
+        ux = 0;
+        uy = 0;
+    }
+	SetEquilibrum(
+		rho,
+		ux*rho,
+		uy*rho
+	);
+
+    // Initialize stencil cache with initial local macro state.
+    IG_rho_cache = rho;
+    IG_ux_cache = ux;
+    IG_uy_cache = uy;
+    IG_f_1 = f[1];
+    IG_f_2 = f[2];
+    IG_f_3 = f[3];
+    IG_f_4 = f[4];
+    IG_f_5 = f[5];
+    IG_f_6 = f[6];
+    IG_f_7 = f[7];
+    IG_f_8 = f[8];
+
+    // Build the single image-ghost metadata entry from the precomputed mask.
+    // Choose normal/origin depending on whether this boundary node is an inlet or an outlet.
+    real_t nx, ny;
+    real_t x0, y0;
+    if ((NodeType & NODE_OBJECTIVE) == NODE_Outlet) {
+        nx = ONormalX;
+        ny = ONormalY;
+        x0 = OOriginX;
+        y0 = OOriginY;
+    } else {
+        nx = INormalX;
+        ny = INormalY;
+        x0 = IOriginX;
+        y0 = IOriginY;
+    }
+    real_t norm_n = sqrt(nx * nx + ny * ny);
+    if (norm_n < 1e-20) {
+        nx = 1.0;
+        ny = 0.0;
+    } else {
+        nx /= norm_n;
+        ny /= norm_n;
+    }
+    real_t x_here = (real_t)X;
+    real_t y_here = (real_t)Y;
+
+    IG_has = 0.0;
+    IG_xi_x = x_here;
+    IG_xi_y = y_here;
+    if (IG_ghost_mask > 0.5) {
+        IG_has = 1.0;
+        real_t phi = (x_here - x0) * nx + (y_here - y0) * ny;
+        IG_xi_x = x_here - 2.0 * phi * nx;
+        IG_xi_y = y_here - 2.0 * phi * ny;
+    }
+}
+
+CudaDeviceFunction void Run() {
+    switch (NodeType & NODE_BOUNDARY) {
+	case NODE_Solid:
+	case NODE_Wall:
+		BounceBack();
+		break;
+	case NODE_EVelocity:
+		EVelocity();
+		break;
+	case NODE_WPressure:
+		WPressure();
+		break;
+	case NODE_WVelocity:
+		WVelocity();
+		break;
+    case NODE_AVelocity:
+        AVelocity();
+        break;
+    case NODE_APressure:
+        APressure();
+        break;
+	case NODE_EPressure:
+		EPressure();
+		break;
+	case NODE_NVelocity:
+		NVelocity();
+		break;
+	case NODE_SVelocity:
+		SVelocity();
+		break;
+    case NODE_NSymmetry:
+        NSymmetry();
+        break;
+    case NODE_SSymmetry:
+        SSymmetry();
+        break;
+    }
+                if ((NodeType & NODE_MRT) && !(NodeType & NODE_AVelocity) && !(NodeType & NODE_APressure)) //I-G algorithm computes post collision vals
+    {
+		CollisionMRT();
+    }
+    /*if (NodeType & NODE_AVelocity)
+    {
+            AVelocity();
+    }*/
+    IGUpdateMacroCache();
+}
+
+CudaDeviceFunction void BounceBack()
+{
+<?R
+	if ( Options$bc ) {
+		C(PV('real_t temp'), sum(f))
+?>
+    if ( temp !=  1+Pressure*3 ) {
+        <?R C(PV(c('BC[0]', 'BC[1]')), 2.* f %*% U); ?>
+    } else {
+        <?R C(PV(c('BC[0]', 'BC[1]')), c(0,0) ); ?>
+    }
+<?R
+	}
+	FullBounceBack()
+?>
+}
+
+CudaDeviceFunction void EVelocity()
+{
+<?R ZouHeRewrite(EQ, f, c(1, 0), "velocity", BC_Velocity) ?>
+}
+
+CudaDeviceFunction void WPressure()
+{
+<?R ZouHeRewrite(EQ, f, c(-1, 0), "pressure") ?>
+}
+
+
+CudaDeviceFunction void WVelocity()
+{
+<?R ZouHeRewrite(EQ, f, c(-1, 0), "velocity", BC_Velocity) ?>
+}
+
+CudaDeviceFunction void AVelocity()
+{
+    // Arbitrary direction inlet using image-ghost reconstruction.
+    real_t uwx = VelocityX;
+    real_t uwy = VelocityY;
+<?R if ( Options$bc ) { ?>
+    uwx = BC[0];
+    uwy = BC[1];
+<?R } ?>
+
+    const real_t rho_ref = 1.0 * (1.0 + Pressure * 3.0);
+
+    const real_t D2Q9_CX[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
+    const real_t D2Q9_CY[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
+    const real_t D2Q9_W[9]  = {
+        4.0/9.0,
+        1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0,
+        1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0
+    };
+
+    if (IG_has <= 0.5) {
+        SetEquilibrum(rho_ref, uwx * rho_ref, uwy * rho_ref);
+<?R if ( Options$bc ) { ?>
+        BC[0] = uwx;
+        BC[1] = uwy;
+<?R } ?>
+        return;
+    }
+
+    // Baseline all populations to the prescribed inlet state, then overwrite
+    // them using the shared image point.
+    SetEquilibrum(rho_ref, uwx * rho_ref, uwy * rho_ref);
+
+    // Reconstruct each direction from the shared image point.
+    real_t rho_i, ui_x, ui_y;
+    IGBilinearImageState(IG_xi_x, IG_xi_y, &rho_i, &ui_x, &ui_y);
+    if (rho_i <= 1e-20 || !IGIsFinite(rho_i) || !IGIsFinite(ui_x) || !IGIsFinite(ui_y)) {
+        rho_i = rho_ref;
+        ui_x = uwx;
+        ui_y = uwy;
+    }
+
+    real_t usx = 2.0 * uwx - ui_x;
+    real_t usy = 2.0 * uwy - ui_y;
+    real_t rho_s = rho_ref;
+    real_t us2 = usx * usx + usy * usy;
+    real_t ui2 = ui_x * ui_x + ui_y * ui_y;
+
+    for (int q = 1; q <= 8; q++) {
+        // Interpolate the non-equilibrium population at the image point.
+        real_t f_i = IGBilinearImagePopulation(q, IG_xi_x, IG_xi_y);
+
+        real_t cu_i = D2Q9_CX[q] * ui_x + D2Q9_CY[q] * ui_y;
+        real_t feq_i = D2Q9_W[q] * rho_i * (1.0 + 3.0 * cu_i + 4.5 * cu_i * cu_i - 1.5 * ui2);
+        real_t fneq_i = f_i - feq_i;
+
+        real_t cu_s = D2Q9_CX[q] * usx + D2Q9_CY[q] * usy;
+        real_t feq_s = D2Q9_W[q] * rho_s * (1.0 + 3.0 * cu_s + 4.5 * cu_s * cu_s - 1.5 * us2);
+
+        real_t f_new = feq_s + fneq_i;
+        if (/* IGIsFinite(f_new) */ 1) {
+            f[q] = f_new;
+        }
+    }
+
+<?R if ( Options$bc ) { ?>
+    BC[0] = uwx;
+    BC[1] = uwy;
+<?R } ?>
+}
+
+CudaDeviceFunction void APressure()
+{
+    // Arbitrary direction pressure outlet using the shared image-ghost point.
+    // Outlet reference density from gauge pressure.
+    const real_t rho_ref = 1.0 * (1.0 + Pressure * 3.0);
+
+    const real_t D2Q9_CX[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
+    const real_t D2Q9_CY[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
+    const real_t D2Q9_W[9]  = {
+        4.0/9.0,
+        1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0,
+        1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0
+    };
+
+    /*if (IG_has <= 0.5) {
+        SetEquilibrum(rho_ref, 0.0, 0.0);
+        return;
+    }*/
+
+    // Get interior state first (velocity and density).
+    real_t rho_i, ui_x, ui_y;
+    IGBilinearImageState(IG_xi_x, IG_xi_y, &rho_i, &ui_x, &ui_y);
+    if (rho_i <= 1e-20 || !IGIsFinite(rho_i) || !IGIsFinite(ui_x) || !IGIsFinite(ui_y)) {
+        rho_i = rho_ref;
+        ui_x = 0.0;
+        ui_y = 0.0;
+    }
+
+    // Use interior velocity with outlet pressure for baseline: smooth velocity profile.
+    SetEquilibrum(rho_ref, ui_x * rho_ref, ui_y * rho_ref);
+
+    real_t usx = ui_x;
+    real_t usy = ui_y;
+    real_t rho_s = rho_i;
+    real_t us2 = usx * usx + usy * usy;
+    real_t ui2 = ui_x * ui_x + ui_y * ui_y;
+
+    for (int q = 1; q <= 8; q++) {
+        // Interpolate the non-equilibrium population at the image point.
+        real_t f_i = IGBilinearImagePopulation(q, IG_xi_x, IG_xi_y);
+
+        real_t cu_i = D2Q9_CX[q] * ui_x + D2Q9_CY[q] * ui_y;
+        real_t feq_i = D2Q9_W[q] * rho_i * (1.0 + 3.0 * cu_i + 4.5 * cu_i * cu_i - 1.5 * ui2);
+        real_t fneq_i = f_i - feq_i;
+
+        real_t cu_s = D2Q9_CX[q] * usx + D2Q9_CY[q] * usy;
+        real_t feq_s = D2Q9_W[q] * rho_s * (1.0 + 3.0 * cu_s + 4.5 * cu_s * cu_s - 1.5 * us2);
+
+        real_t f_new = feq_s + fneq_i;
+        if (/* IGIsFinite(f_new) */ 1) {
+            f[q] = f_new;
+        }
+    }
+}
+
+CudaDeviceFunction void EPressure()
+{
+<?R ZouHeRewrite(EQ, f, c(1, 0), "pressure") ?>
+}
+
+CudaDeviceFunction void NVelocity()
+{
+<?R ZouHeRewrite(EQ, f, c(0,1), "velocity", BC_Velocity) ?>
+}
+
+CudaDeviceFunction void SVelocity()
+{
+<?R ZouHeRewrite(EQ, f, c(0, -1), "velocity", BC_Velocity) ?>
+}
+
+CudaDeviceFunction void NSymmetry()
+{
+<?R Symmetry(2,-1,'f') ?>
+}
+
+CudaDeviceFunction void SSymmetry()
+{
+<?R Symmetry(2,1,'f') ?>
+}
+
+CudaDeviceFunction void CollisionMRT()
+{
+
+<?R
+	MI = solve(EQ$mat)
+	P = MI %*% diag(1/wi) %*% t(MI)
+
+	R = PV("R", 1:nrow(U)-1);
+	selR = EQ$order > 1
+	R[!selR] = EQ$Req[!selR]
+?>
+
+
+ 
+	real_t <?R C(R,sep=",") ?>;
+    real_t Usq=0;
+
+<?R
+    S=PV("S",1:nrow(U)-1);
+	S[EQ$order == 2] = PV("S2")
+	S[EQ$order == 3] = PV("S3")
+ 	S[EQ$order == 4] = PV("S4")   
+	C( R, f %*% EQ$mat );
+
+?>
+
+    switch (NodeType & NODE_OBJECTIVE) {
+        case NODE_Outlet:
+<?R 
+            Usq=PV('Usq')
+            C(Usq,sum(J%*%J) * rho ^-2)
+
+?>
+            AddToOutletFlux(Jx/rho/rho);
+            AddToPressureLoss(-(Jx/rho)/rho*((rho-1.)/3. + Usq/rho/2.));
+        break;
+        case NODE_Inlet:
+<?R
+            Usq=PV('Usq')
+            C(Usq,sum(J%*%J) * rho ^-2)
+?>
+           AddToInletFlux(Jx/rho/rho);
+           AddToPressureLoss((Jx/rho)/rho*((rho-1.)/3. + Usq/rho/2.));
+       break;
+    }
+
+<?R
+	C( R[selR], (R - EQ$Req)[selR]);
+	C( R[selR], (R * S)[selR]);
+
+?>
+
+<?R if ( Options$bc ) { ?>
+    if (!IamBOUNDARY) {
+        Jx = Jx + (GravitationX +  BC[0])*rho ;
+        Jy = Jy + (GravitationY +  BC[1])*rho ; 
+    }
+<?R } else { ?>
+    Jx = Jx + GravitationX*rho;
+    Jy = Jy + GravitationY*rho; 
+<?R } ?>
+
+<?R
+    C( R[selR], (R + EQ$Req)[selR]);
+	C( f, R %*% solve(EQ$mat), float=F);
+?>
+}
+
